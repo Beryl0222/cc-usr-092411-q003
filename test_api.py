@@ -209,6 +209,112 @@ class ApiFlowTest(unittest.TestCase):
         status, _ = call("GET", f"{self.base}/unknown")
         self.assertEqual(status, 404)
 
+    def test_conflicting_retransmission_is_reported_not_overwritten(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        events_url = f"/tasks/{task['task_id']}/events"
+        self.post(events_url, 202, {"events": [ad("a1"), close("a1", 2, after=5, size=36)]})
+
+        # 字段顺序变化的完全重放 → 重复而非冲突
+        reordered = {"type": "ad_shown",
+                     "payload": {"placement": "splash", "ad_id": "a1"},
+                     "event_id": "e-a1-shown", "occurred_at": NOW + 100, "seq": 1}
+        replay = self.post(events_url, 202, {"events": [reordered]})
+        self.assertEqual(replay["duplicates"], ["e-a1-shown"])
+        self.assertEqual(replay["conflicts"], [])
+
+        # 同号异内容 → 冲突，响应定位编号与差异字段
+        changed = close("a1", 2, after=5, size=36)
+        changed["payload"]["touch_target_dp"] = 30
+        changed["payload"]["screen_reader_actionable"] = False
+        result = self.post(events_url, 202, {"events": [changed]})
+        self.assertEqual(result["accepted"], [])
+        self.assertEqual(result["duplicates"], [])
+        conflict = result["conflicts"][0]
+        self.assertEqual(conflict["event_id"], "e-a1-close-2")
+        self.assertEqual(conflict["diff_fields"],
+                         ["payload.screen_reader_actionable", "payload.touch_target_dp"])
+        self.assertEqual([r["status"] for r in result["results"]], ["conflict"])
+
+        # 任务报告定位冲突编号、差异字段与双份摘要；首次证据未被覆盖
+        report = self.get(f"/tasks/{task['task_id']}")
+        self.assertEqual(report["event_count"], 2)
+        self.assertEqual(len(report["conflicts"]), 1)
+        saved = report["conflicts"][0]
+        self.assertEqual(saved["event_id"], "e-a1-close-2")
+        self.assertEqual(saved["first"]["content"]["payload"]["touch_target_dp"], 36)
+        self.assertEqual(saved["incoming"]["content"]["payload"]["touch_target_dp"], 30)
+        self.assertEqual(saved["occurrences"], 1)
+
+    def test_first_fingerprint_reused_after_store_reload(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self._seed()
+            task = self._create_task("dev-A", "normal")
+            events_url = f"/tasks/{task['task_id']}/events"
+            self.post(events_url, 202, {"events": [ad("a1")]})
+
+            service.reset_store(path)  # 模拟进程恢复：从快照重建仓储
+            replay = self.post(events_url, 202, {"events": [ad("a1")]})
+            self.assertEqual(replay["duplicates"], ["e-a1-shown"])
+            changed = ad("a1")
+            changed["occurred_at"] = NOW + 500
+            result = self.post(events_url, 202, {"events": [changed]})
+            self.assertEqual(result["accepted"], [])
+            self.assertEqual(result["conflicts"][0]["event_id"], "e-a1-shown")
+            self.assertEqual(result["conflicts"][0]["diff_fields"], ["occurred_at"])
+            report = self.get(f"/tasks/{task['task_id']}")
+            self.assertEqual(report["event_count"], 1)  # 首次证据未被覆盖
+            self.assertEqual(len(report["conflicts"]), 1)
+        finally:
+            service.reset_store()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_concurrent_ingest_arrivals_are_consistent(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        url = f"{self.base}/tasks/{task['task_id']}/events"
+
+        def wave(event, count):
+            barrier = threading.Barrier(count)
+            outcomes = []
+
+            def worker():
+                barrier.wait()
+                outcomes.append(call("POST", url, {"events": [event]}))
+
+            threads = [threading.Thread(target=worker) for _ in range(count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            return outcomes
+
+        # 并发到达的完全重放：恰好一条接收，其余判重
+        first_wave = wave(ad("a1"), 8)
+        statuses = [payload["results"][0]["status"] for _, payload in first_wave]
+        self.assertEqual(statuses.count("accepted"), 1)
+        self.assertEqual(statuses.count("duplicate"), 7)
+        report = self.get(f"/tasks/{task['task_id']}")
+        self.assertEqual(report["event_count"], 1)
+        self.assertEqual(report["conflicts"], [])
+
+        # 并发到达的同号异内容：全部判冲突，首次证据不动
+        changed = ad("a1")
+        changed["payload"]["placement"] = "lockscreen"
+        second_wave = wave(changed, 8)
+        statuses = [payload["results"][0]["status"] for _, payload in second_wave]
+        self.assertEqual(statuses, ["conflict"] * 8)
+        report = self.get(f"/tasks/{task['task_id']}")
+        self.assertEqual(report["event_count"], 1)
+        self.assertEqual(len(report["conflicts"]), 1)
+        self.assertEqual(report["conflicts"][0]["occurrences"], 8)
+        self.assertEqual(report["conflicts"][0]["diff_fields"], ["payload.placement"])
+
     def test_snapshot_file_persistence(self):
         fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
         os.close(fd)

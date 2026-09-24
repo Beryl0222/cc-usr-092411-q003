@@ -10,9 +10,11 @@
 - **证据只增不改**：设备、构建、事件、规范版本只允许登记不允许覆盖。开发者提交新版
   得到新 `build_id`，旧构建证据原样保留；告知材料出具时对发现做快照，事后任何操作
   不改变材料内容。
-- **采集幂等**：事件按 `(task_id, event_id)` 去重，重传统一进入 `duplicates`；任务
-  完成后的迟到事件照常追加（标记 `late=true`）并触发追加判定，判定按指纹去重，不
-  产生重复发现，也不回改既有结论。
+- **采集幂等**：事件按 `(task_id, event_id)` 定位后比较规范化内容指纹——内容完全
+  一致的重传进入 `duplicates`；编号相同而内容不同（广告位、发生时间、事件类型、
+  责任主体等任一变化）判为 `conflicts`，双份摘要并存，首次证据不覆盖、不触发
+  重新判定、不改既有发现；任务完成后的迟到事件照常追加（标记 `late=true`）并触发
+  追加判定，判定按指纹去重，不产生重复发现，也不回改既有结论。
 - **版本固化**：创建任务时固化当时生效的规范版本与最新脚本版本；规范或脚本更新只
   影响之后创建的任务，旧任务永远按原版本判定。
 - **规则与复核分离**：自动规则只能产生 `suspected`（涉嫌）发现；复核员 `confirmed`
@@ -39,7 +41,7 @@
 python3 service.py --check          # 基础自检
 python3 service.py --port 8000      # 启动服务
 LAB_DATA_FILE=lab.json python3 service.py   # 证据快照落盘，重启恢复
-npm test                            # 运行契约 + 领域 + HTTP 共 18 项测试
+npm test                            # 运行契约 + 领域 + HTTP 共 30 项测试
 ```
 
 ## 接口一览
@@ -54,9 +56,9 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 | `POST /devices` | 登记设备（`device_id`、`model`、`os_version`） |
 | `POST /builds` | 登记应用构建（`app_id`、`app_name`、`developer`、`version_code`） |
 | `POST /tasks` | 创建采集任务（`build_id`、`device_id`、`track`），响应含固化版本 |
-| `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates` |
+| `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates/conflicts` 与逐条 `results` |
 | `POST /tasks/{id}/complete` | 完成采集并运行规则 |
-| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据 |
+| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据/编号冲突记录 |
 | `GET /builds/{id}/report` | 同一构建跨设备、跨轨迹汇总 |
 | `POST /findings/{id}/review` | 复核：`{"decision": "confirmed|dismissed", "reviewer"}` |
 | `POST /subjects/{type}/{id}/notices` | 对已确认发现出具告知材料（期限、依据版本、证据快照） |
@@ -67,7 +69,7 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 
 ```json
 {
-  "event_id": "端上唯一事件号（重传判重依据）",
+  "event_id": "端上唯一事件号（重传判重依据；同号异内容判冲突）",
   "seq": 1,
   "type": "ad_shown | close_affordance | sensor_reading | jump | network_response | gesture",
   "occurred_at": 1700000100,

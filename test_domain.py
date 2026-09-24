@@ -430,5 +430,173 @@ class DomainFlowTest(unittest.TestCase):
         return rows[0] if rows else None
 
 
+class IngestConflictTest(unittest.TestCase):
+    """采集幂等边界：内容指纹判重、同号异内容判冲突、批次原子一致。"""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.lab = base_lab(self.clock)
+        self.task = self.lab.create_task(
+            {"build_id": BUILD_V1, "device_id": DEV_A, "track": TRACK_NORMAL})
+        self.tid = self.task["task_id"]
+
+    def test_reordered_fields_replay_is_duplicate_not_conflict(self):
+        self.lab.ingest_events(self.tid, [ad("a1")])
+        # 顶层与 payload 字段顺序全部重排，内容完全一致
+        reordered = {"type": "ad_shown",
+                     "payload": {"placement": "splash", "ad_id": "a1"},
+                     "event_id": "e-a1-shown", "occurred_at": NOW + 100, "seq": 1}
+        again = self.lab.ingest_events(self.tid, [reordered])
+        self.assertEqual(again["accepted"], [])
+        self.assertEqual(again["duplicates"], ["e-a1-shown"])
+        self.assertEqual(again["conflicts"], [])
+        self.assertEqual(self.task["event_ids"], ["e-a1-shown"])
+
+    def test_changed_placement_and_time_is_conflict_and_first_evidence_kept(self):
+        self.lab.ingest_events(self.tid, [ad("a1")])
+        changed = ad("a1")
+        changed["payload"] = {"ad_id": "a1", "placement": "lockscreen"}  # 广告位变化
+        changed["occurred_at"] = NOW + 999                               # 发生时间变化
+        result = self.lab.ingest_events(self.tid, [changed])
+        self.assertEqual(result["accepted"], [])
+        self.assertEqual(result["duplicates"], [])
+        self.assertEqual(len(result["conflicts"]), 1)
+        conflict = result["conflicts"][0]
+        self.assertEqual(conflict["event_id"], "e-a1-shown")
+        self.assertEqual(conflict["diff_fields"],
+                         ["occurred_at", "payload.placement"])
+        # 首次证据未被覆盖
+        stored = self.lab.events[(self.tid, "e-a1-shown")]
+        self.assertEqual(stored["payload"]["placement"], "splash")
+        self.assertEqual(stored["occurred_at"], NOW + 100)
+        # 双份摘要均保存，可按编号与差异字段定位
+        record = self.lab.task_report(self.tid)["conflicts"][0]
+        self.assertEqual(record["event_id"], "e-a1-shown")
+        self.assertEqual(record["first"]["content"]["payload"]["placement"], "splash")
+        self.assertEqual(record["incoming"]["content"]["payload"]["placement"], "lockscreen")
+        self.assertEqual(record["first"]["received_at"], stored["received_at"])
+        # 相同冲突内容重复上报只累计次数，不重复建档
+        self.lab.ingest_events(self.tid, [changed])
+        records = self.lab.task_report(self.tid)["conflicts"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["occurrences"], 2)
+
+    def test_changed_type_is_conflict(self):
+        self.lab.ingest_events(self.tid, [network("a1", 7, NOW + 130, 200, "https://ad.example/i")])
+        changed = network("a1", 7, NOW + 130, 200, "https://ad.example/i")
+        changed["type"] = "jump"  # 事件类型变化
+        result = self.lab.ingest_events(self.tid, [changed])
+        self.assertEqual(result["conflicts"][0]["diff_fields"], ["type"])
+        self.assertEqual(self.lab.events[(self.tid, "e-a1-net-7")]["type"], "network_response")
+
+    def test_changed_responsible_subject_is_conflict(self):
+        self.lab.ingest_events(self.tid, [jump("a1", 3, NOW + 106, "auto", sdk=SDK_ID)])
+        changed = jump("a1", 3, NOW + 106, "auto", sdk="other-sdk-1")  # 责任主体变化
+        result = self.lab.ingest_events(self.tid, [changed])
+        self.assertEqual(result["conflicts"][0]["diff_fields"], ["payload.sdk.id"])
+        stored = self.lab.events[(self.tid, "e-a1-jump-3")]
+        self.assertEqual(stored["payload"]["sdk"]["id"], SDK_ID)
+
+    def test_conflict_after_completion_is_not_late_evidence_and_skips_reassessment(self):
+        self.lab.ingest_events(self.tid, [ad("a1"), close("a1", 2, after=5, size=36)])
+        self.lab.complete_task(self.tid)
+        findings_before = set(self.lab.findings)
+        count_before = self.task["assessment_count"]
+
+        changed = ad("a1")
+        changed["occurred_at"] = NOW + 555
+        result = self.lab.ingest_events(self.tid, [changed])
+        self.assertEqual(result["conflicts"][0]["event_id"], "e-a1-shown")
+        self.assertNotIn("assessment", result)          # 冲突不触发重新判定
+        self.assertNotIn("late_arrivals", result)       # 冲突不得伪装成迟到证据
+        self.assertEqual(self.task["assessment_count"], count_before)
+        self.assertEqual(set(self.lab.findings), findings_before)  # 既有发现不变
+        stored = self.lab.events[(self.tid, "e-a1-shown")]
+        self.assertFalse(stored["late"])                # 首次证据未被改写
+        self.assertEqual(stored["occurred_at"], NOW + 100)
+
+        # 同批混入真正的新事件：新事件按原规则迟到追加并复判，冲突仍是冲突
+        mixed = self.lab.ingest_events(self.tid, [
+            changed, jump("a1", 9, NOW + 300, "auto", sdk=SDK_ID)])
+        self.assertEqual(mixed["accepted"], ["e-a1-jump-9"])
+        self.assertEqual([c["event_id"] for c in mixed["conflicts"]], ["e-a1-shown"])
+        self.assertTrue(mixed["late_arrivals"])
+        self.assertIn("assessment", mixed)
+        self.assertTrue(self.lab.events[(self.tid, "e-a1-jump-9")]["late"])
+
+    def test_mixed_batch_reports_per_item_results(self):
+        self.lab.ingest_events(self.tid, [ad("a1")])
+        changed = ad("a1")
+        changed["occurred_at"] = NOW + 500
+        batch = [
+            network("a1", 9, NOW + 107, 200, "https://ad.example/i"),  # 新事件
+            ad("a1"),                                                  # 完全重放
+            changed,                                                   # 冲突
+        ]
+        result = self.lab.ingest_events(self.tid, batch)
+        self.assertEqual(result["accepted"], ["e-a1-net-9"])
+        self.assertEqual(result["duplicates"], ["e-a1-shown"])
+        self.assertEqual([c["event_id"] for c in result["conflicts"]], ["e-a1-shown"])
+        self.assertEqual(
+            [(r["event_id"], r["status"]) for r in result["results"]],
+            [("e-a1-net-9", "accepted"), ("e-a1-shown", "duplicate"),
+             ("e-a1-shown", "conflict")])
+        # 接收与任务索引原子一致：索引中的每条都在仓储中，且只有这些
+        self.assertEqual(set(self.task["event_ids"]), {"e-a1-shown", "e-a1-net-9"})
+        for event_id in self.task["event_ids"]:
+            self.assertIn((self.tid, event_id), self.lab.events)
+
+    def test_same_event_id_across_tasks_is_independent(self):
+        other = self.lab.create_task(
+            {"build_id": BUILD_V1, "device_id": DEV_B, "track": TRACK_NORMAL})
+        self.lab.ingest_events(self.tid, [ad("a1")])
+        # 同号同内容出现在另一任务：各自独立接收，不算冲突
+        accepted = self.lab.ingest_events(other["task_id"], [ad("a1")])
+        self.assertEqual(accepted["accepted"], ["e-a1-shown"])
+        self.assertEqual(accepted["conflicts"], [])
+        # 另一任务内的同号异内容仍判冲突，且不波及首个任务
+        changed = ad("a1")
+        changed["payload"]["placement"] = "lockscreen"
+        result = self.lab.ingest_events(other["task_id"], [changed])
+        self.assertEqual(result["conflicts"][0]["event_id"], "e-a1-shown")
+        self.assertEqual(self.lab.task_report(self.tid)["conflicts"], [])
+        self.assertEqual(len(self.lab.task_report(other["task_id"])["conflicts"]), 1)
+
+    def test_invalid_batch_is_rejected_atomically(self):
+        with self.assertRaises(DomainError):
+            self.lab.ingest_events(self.tid, [
+                ad("a1"),
+                {"event_id": "e-bad", "seq": 9, "type": "not_a_type",
+                 "occurred_at": NOW},
+            ])
+        with self.assertRaises(DomainError):
+            self.lab.ingest_events(self.tid, [
+                {"event_id": "e-x", "type": "gesture"},  # 缺 seq/occurred_at
+            ])
+        # 整批拒绝：接收仓储与任务索引都不留半批写入
+        self.assertEqual(self.task["event_ids"], [])
+        self.assertEqual(dict(self.lab.events), {})
+
+    def test_snapshot_restore_reuses_first_fingerprint_and_keeps_conflicts(self):
+        self.lab.ingest_events(self.tid, [ad("a1")])
+        changed = ad("a1")
+        changed["payload"]["placement"] = "lockscreen"
+        self.lab.ingest_events(self.tid, [changed])  # 冲突记录随快照保存
+
+        restored = Lab.from_snapshot(self.lab.to_snapshot(), clock=self.clock)
+        replay = restored.ingest_events(self.tid, [ad("a1")])
+        self.assertEqual(replay["duplicates"], ["e-a1-shown"])  # 恢复后沿用首次指纹
+        other = ad("a1")
+        other["occurred_at"] = NOW + 777
+        result = restored.ingest_events(self.tid, [other])
+        self.assertEqual(result["conflicts"][0]["event_id"], "e-a1-shown")
+        self.assertEqual(result["conflicts"][0]["diff_fields"], ["occurred_at"])
+        report = restored.task_report(self.tid)
+        self.assertEqual(len(report["conflicts"]), 2)  # 恢复前 1 条 + 恢复后 1 条
+        # 首次证据仍是原内容
+        self.assertEqual(
+            restored.events[(self.tid, "e-a1-shown")]["payload"]["placement"], "splash")
+
+
 if __name__ == "__main__":
     unittest.main()
