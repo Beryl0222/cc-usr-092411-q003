@@ -10,9 +10,16 @@
 - **证据只增不改**：设备、构建、事件、规范版本只允许登记不允许覆盖。开发者提交新版
   得到新 `build_id`，旧构建证据原样保留；告知材料出具时对发现做快照，事后任何操作
   不改变材料内容。
-- **采集幂等**：事件按 `(task_id, event_id)` 去重，重传统一进入 `duplicates`；任务
-  完成后的迟到事件照常追加（标记 `late=true`）并触发追加判定，判定按指纹去重，不
-  产生重复发现，也不回改既有结论。
+- **采集幂等**：事件按 `(task_id, event_id)` 与「规范化内容指纹」双重判重。
+  字段顺序变化不影响判重——规范化内容完全一致才列入 `duplicates`；编号相同而
+  广告位、发生时间、事件类型或责任主体等内容不同时作为 `conflicts` 返回，保存
+  首次与冲突两份摘要，**不覆盖首次证据、不进入任务事件索引、不触发重新判定，也
+  不改动既有发现**。任务完成后的迟到新事件照常追加（标记 `late=true`）并触发
+  追加判定，判定按指纹去重；但同号异内容冲突即使在任务完成后到达也只记冲突，
+  不得伪装成迟到证据。冲突编号与差异字段在批次响应与任务报告中均可定位。
+- **批次原子**：一个事件批次先整体校验再统一落地，任一条非法则整批拒绝，
+  事件接收仓储与任务事件索引要么一致更新、要么都不动。批次中混有新事件、
+  完全重放与冲突事件时，按 `results` 逐条报告 `accepted/duplicate/conflict`。
 - **版本固化**：创建任务时固化当时生效的规范版本与最新脚本版本；规范或脚本更新只
   影响之后创建的任务，旧任务永远按原版本判定。
 - **规则与复核分离**：自动规则只能产生 `suspected`（涉嫌）发现；复核员 `confirmed`
@@ -39,7 +46,7 @@
 python3 service.py --check          # 基础自检
 python3 service.py --port 8000      # 启动服务
 LAB_DATA_FILE=lab.json python3 service.py   # 证据快照落盘，重启恢复
-npm test                            # 运行契约 + 领域 + HTTP 共 18 项测试
+npm test                            # 运行契约 + 领域 + HTTP 共 36 项测试
 ```
 
 ## 接口一览
@@ -54,7 +61,7 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 | `POST /devices` | 登记设备（`device_id`、`model`、`os_version`） |
 | `POST /builds` | 登记应用构建（`app_id`、`app_name`、`developer`、`version_code`） |
 | `POST /tasks` | 创建采集任务（`build_id`、`device_id`、`track`），响应含固化版本 |
-| `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates` |
+| `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，逐条返回 `results`（`accepted/duplicate/conflict`），并汇总 `accepted/duplicates/conflicts` |
 | `POST /tasks/{id}/complete` | 完成采集并运行规则 |
 | `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据 |
 | `GET /builds/{id}/report` | 同一构建跨设备、跨轨迹汇总 |
@@ -86,6 +93,41 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
   }
 }
 ```
+
+### 批次上报响应（幂等边界）
+
+指纹只覆盖 `seq/type/occurred_at/payload`（`received_at`、`late` 为服务端状态，
+不参与比对），JSON 键经排序规范化，故字段顺序变化仍判重。
+
+```json
+{
+  "accepted": ["e-new-1"],
+  "duplicates": ["e-a1-shown"],
+  "conflicts": [
+    {
+      "event_id": "e-a1-shown",
+      "differing_fields": ["payload.advertiser.id", "payload.placement"],
+      "first": {"seq": 1, "type": "ad_shown", "occurred_at": 1700000100,
+                "payload": {"ad_id": "a1", "placement": "splash"}},
+      "conflicting": {"seq": 1, "type": "ad_shown", "occurred_at": 1700000100,
+                      "payload": {"ad_id": "a1", "placement": "lockscreen"}},
+      "conflict_count": 1,
+      "first_received_at": 1700000200,
+      "latest_conflict_at": 1700000300
+    }
+  ],
+  "results": [
+    {"event_id": "e-new-1", "status": "accepted"},
+    {"event_id": "e-a1-shown", "status": "duplicate"},
+    {"event_id": "e-a1-shown", "status": "conflict",
+     "differing_fields": ["payload.advertiser.id", "payload.placement"]}
+  ],
+  "late_arrivals": false
+}
+```
+
+冲突不改变 HTTP 状态（整批仍为 `202`，逐条见 `results`），也不覆盖首次证据；
+任务报告 `GET /tasks/{id}` 的 `conflicts` 段同样可定位冲突编号与差异字段。
 
 ## 模块
 

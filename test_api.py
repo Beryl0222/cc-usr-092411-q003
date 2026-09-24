@@ -16,7 +16,6 @@ NOW = 1_700_000_000
 APP_ID = "com.example.news"
 SDK_ID = "shake-sdk-9"
 
-
 def call(method, url, body=None):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json; charset=utf-8"} if data else {}
@@ -47,6 +46,206 @@ def jump(ad_id, seq, at, trigger, sdk=None, **extra):
     payload.update(extra)
     return {"event_id": f"e-{ad_id}-jump-{seq}", "seq": seq, "type": "jump",
             "occurred_at": at, "payload": payload}
+
+
+def event(event_id, seq=1, type="ad_shown", at=NOW + 100, payload=None):
+    return {"event_id": event_id, "seq": seq, "type": type,
+            "occurred_at": at, "payload": {} if payload is None else payload}
+
+
+class IdempotencyApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        service.reset_store()
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def setUp(self):
+        service.reset_store()
+        self.post("/admin/regulations", 201,
+                  {"version": "v2025.1", "effective_at": 0, "params": {"rectification_days": 10}})
+        self.post("/devices", 201,
+                  {"device_id": "dev-A", "model": "Pixel 6", "os_version": "Android 12"})
+        self.post("/builds", 201, {
+            "app_id": APP_ID, "app_name": "某新闻", "developer": "某新闻运营有限公司",
+            "version_code": 1001, "version_name": "8.1.0"})
+
+    def post(self, path, expected, body):
+        status, payload = call("POST", self.base + path, body)
+        self.assertEqual(status, expected, payload)
+        return payload
+
+    def get(self, path, expected=200):
+        status, payload = call("GET", self.base + path)
+        self.assertEqual(status, expected, payload)
+        return payload
+
+    def _task(self, device="dev-A", track="normal"):
+        return self.post("/tasks", 201,
+                         {"build_id": f"{APP_ID}:1001", "device_id": device, "track": track})
+
+    def _ingest(self, tid, events):
+        return self.post(f"/tasks/{tid}/events", 202, {"events": events})
+
+    def test_mixed_batch_new_replay_conflict_reports_per_row(self):
+        task = self._task()["task_id"]
+        self._ingest(task, [event("c1", payload={"ad_id": "a1", "placement": "splash"})])
+        batch = [
+            event("new-1", seq=2, type="gesture"),
+            event("c1", payload={"ad_id": "a1", "placement": "splash"}),       # 完全重放
+            event("c1", payload={"ad_id": "a1", "placement": "lockscreen"}),   # 冲突
+        ]
+        res = self._ingest(task, batch)
+        self.assertEqual(res["accepted"], ["new-1"])
+        self.assertEqual(res["duplicates"], ["c1"])
+        rows = {r["event_id"]: r for r in res["results"]}
+        self.assertEqual(rows["new-1"]["status"], "accepted")
+        self.assertEqual(rows["c1"]["status"], "conflict")
+        self.assertIn("payload.placement", rows["c1"]["differing_fields"])
+        conflict = res["conflicts"][0]
+        self.assertEqual(conflict["first"]["payload"]["placement"], "splash")
+        self.assertEqual(conflict["conflicting"]["payload"]["placement"], "lockscreen")
+
+        # 任务报告可定位冲突编号与差异字段，首次证据未被覆盖
+        report = self.get(f"/tasks/{task}")
+        self.assertEqual(report["event_count"], 2)
+        self.assertEqual([c["event_id"] for c in report["conflicts"]], ["c1"])
+        self.assertIn("payload.placement", report["conflicts"][0]["differing_fields"])
+
+    def test_field_reordering_is_duplicate(self):
+        task = self._task()["task_id"]
+        original = event("e1", payload={"ad_id": "a1", "placement": "splash",
+                                        "advertiser": {"id": "brand-x"}})
+        reordered = {
+            "payload": {"advertiser": {"id": "brand-x"}, "placement": "splash", "ad_id": "a1"},
+            "occurred_at": NOW + 100, "type": "ad_shown", "seq": 1, "event_id": "e1",
+        }
+        self._ingest(task, [original])
+        again = self._ingest(task, [reordered])
+        self.assertEqual(again["duplicates"], ["e1"])
+        self.assertEqual(again["conflicts"], [])
+        self.assertEqual(again["accepted"], [])
+
+    def test_same_id_in_other_task_is_independent(self):
+        t1 = self._task()["task_id"]
+        self.post("/devices", 201,
+                  {"device_id": "dev-B", "model": "Pixel 8", "os_version": "Android 14"})
+        t2 = self._task(device="dev-B")["task_id"]
+        self._ingest(t1, [event("dup", payload={"ad_id": "a1"})])
+        res = self._ingest(t2, [event("dup", payload={"ad_id": "a1", "placement": "feed"})])
+        self.assertEqual(res["results"][0]["status"], "accepted")  # 跨任务是新事件
+        self.assertEqual(self.get(f"/tasks/{t1}")["conflicts"], [])
+
+    def test_conflict_after_completion_is_not_late_and_late_still_appends(self):
+        task = self._task()["task_id"]
+        self._ingest(task, [ad("a1"), close("a1", 2, after=5, size=36)])
+        self.post(f"/tasks/{task}/complete", 200, {})
+        report_before = self.get(f"/tasks/{task}")
+
+        conflict = self._ingest(task, [ad("a1", placement="lockscreen")])
+        self.assertEqual(conflict["results"][0]["status"], "conflict")
+        self.assertNotIn("assessment", conflict)  # 冲突不触发重新判定
+        self.assertNotIn("late_arrivals", conflict)
+
+        report_after = self.get(f"/tasks/{task}")
+        self.assertEqual(report_after["event_count"], report_before["event_count"])
+        self.assertEqual(len(report_after["findings"]), len(report_before["findings"]))
+        self.assertEqual([c["event_id"] for c in report_after["conflicts"]], ["e-a1-shown"])
+
+        # 真正迟到新事件仍按原规则追加
+        late = self._ingest(task, [jump("a1", 9, NOW + 300, "auto", sdk=SDK_ID)])
+        self.assertEqual(late["accepted"], ["e-a1-jump-9"])
+        self.assertTrue(late["late_arrivals"])
+        self.assertIn("assessment", late)
+
+    def test_concurrent_identical_submissions_accepted_exactly_once(self):
+        task = self._task()["task_id"]
+        ev = event("race", payload={"ad_id": "a1", "placement": "splash"})
+        outcomes = self._run_concurrently(lambda _i: call("POST", f"{self.base}/tasks/{task}/events",
+                                                          {"events": [ev]}), 8)
+        statuses = [s for s, _ in outcomes]
+        self.assertEqual(set(statuses), {202})
+        accepted = [b for _, b in outcomes if b["accepted"] == ["race"]]
+        duplicates = [b for _, b in outcomes if b["duplicates"] == ["race"]]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(duplicates), 7)
+        # 证据只落一份，任务索引一致
+        self.assertEqual(self.get(f"/tasks/{task}")["event_count"], 1)
+
+    def test_concurrent_divergent_same_id_one_wins_others_conflict(self):
+        task = self._task()["task_id"]
+        variants = [
+            event("race2", payload={"ad_id": "a1", "placement": "splash"}),
+            event("race2", payload={"ad_id": "a1", "placement": "lockscreen"}),
+            event("race2", payload={"ad_id": "a1", "placement": "feed"}),
+        ]
+        outcomes = self._run_concurrently(
+            lambda i: call("POST", f"{self.base}/tasks/{task}/events",
+                           {"events": [variants[i]]}), len(variants))
+        self.assertEqual({s for s, _ in outcomes}, {202})
+        accepted = [b for _, b in outcomes if b["accepted"] == ["race2"]]
+        conflicts = [b for _, b in outcomes if b["results"][0]["status"] == "conflict"]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(conflicts), 2)
+        # 只有一条进入任务索引，首次证据保留；冲突可定位编号与差异字段
+        report = self.get(f"/tasks/{task}")
+        self.assertEqual(report["event_count"], 1)
+        record = report["conflicts"][0]
+        self.assertEqual(record["event_id"], "race2")
+        self.assertIn("payload.placement", record["differing_fields"])
+
+    def test_conflict_persists_across_restart_with_first_fingerprint(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            self.post("/admin/regulations", 201, {"version": "v2025.1", "effective_at": 0})
+            self.post("/devices", 201,
+                      {"device_id": "dev-A", "model": "Pixel 6", "os_version": "Android 12"})
+            self.post("/builds", 201, {
+                "app_id": APP_ID, "app_name": "某新闻", "developer": "某新闻运营有限公司",
+                "version_code": 1001})
+            task = self._task()["task_id"]
+            self._ingest(task, [event("persist", payload={"ad_id": "a1", "placement": "splash"})])
+            self._ingest(task, [event("persist", payload={"ad_id": "a1", "placement": "feed"})])
+
+            service.reset_store(path)  # 进程恢复
+            dup = self._ingest(task, [event("persist", payload={"ad_id": "a1",
+                                                                "placement": "splash"})])
+            self.assertEqual(dup["duplicates"], ["persist"])  # 沿用首次指纹判重
+            again = self._ingest(task, [event("persist",
+                                              payload={"ad_id": "a1", "placement": "feed"})])
+            self.assertEqual(again["results"][0]["status"], "conflict")
+            report = self.get(f"/tasks/{task}")
+            self.assertEqual(report["conflicts"][0]["first"]["payload"]["placement"], "splash")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    @staticmethod
+    def _run_concurrently(fn, count):
+        barrier = threading.Barrier(count)
+        results = []
+
+        def worker(i):
+            barrier.wait()
+            results.append(fn(i))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        return results
 
 
 class ApiFlowTest(unittest.TestCase):

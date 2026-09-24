@@ -13,6 +13,8 @@
   开启新的周期并累计回潮次数。
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from itertools import count
 from time import time
@@ -60,6 +62,11 @@ FINDING_DISMISSED = "dismissed"
 CASE_OPEN = "open"
 CASE_RECTIFIED = "rectified"
 
+# 事件批次单条结果状态
+RESULT_ACCEPTED = "accepted"      # 新事件，首次接收
+RESULT_DUPLICATE = "duplicate"    # 编号相同且规范化内容完全一致（重传/重放）
+RESULT_CONFLICT = "conflict"      # 编号相同但规范化内容不同（证据冲突）
+
 # 规则编号（对承办人员与告知材料保持稳定）
 RULE_NO_CLOSE_PATH = "R-CLOSE-001"       # 不存在可操作的关闭路径
 RULE_SHAKE_THRESHOLD = "R-SHAKE-001"     # 摇一摇阈值/读数时间低于规范
@@ -105,6 +112,63 @@ def _display_subject(subject):
     return {"type": subject["type"], "id": subject["id"], "name": subject.get("name", "")}
 
 
+# 接收时刻（received_at）与迟到标记（late）属于服务端状态，不属于证据内容，
+# 重传时本就允许不同，故不纳入规范化指纹；指纹只覆盖 seq/type/occurred_at/payload。
+
+
+def _canonical_event(raw):
+    """提取参与幂等比对的证据内容并规范化（键排序），消除字段顺序差异。"""
+    payload = raw.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "seq": raw.get("seq"),
+        "type": raw.get("type"),
+        "occurred_at": raw.get("occurred_at"),
+        "payload": payload,
+    }
+
+
+def _canonical_digest(canonical):
+    """规范化内容的稳定指纹；规范化结果完全一致才得到相同指纹。"""
+    blob = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _event_summary(raw):
+    """保存一份不依赖原始对象的证据内容摘要（冲突双方各存一份）。"""
+    canonical = _canonical_event(raw)
+    return {
+        "seq": canonical["seq"],
+        "type": canonical["type"],
+        "occurred_at": canonical["occurred_at"],
+        "payload": canonical["payload"],
+    }
+
+
+def _diff_canonical(existing, incoming):
+    """逐字段比对两份规范化内容，返回存在差异的字段路径（如 payload.ad_id）。"""
+    diffs = []
+
+    def walk(path, a, b):
+        if type(a) is not type(b):
+            diffs.append(path)
+            return
+        if isinstance(a, dict):
+            keys = sorted(set(a) | set(b))
+            for key in keys:
+                child = f"{path}.{key}" if path else key
+                if key not in a or key not in b:
+                    diffs.append(child)
+                else:
+                    walk(child, a[key], b[key])
+        elif a != b:
+            diffs.append(path)
+
+    walk("", existing, incoming)
+    return diffs
+
+
 @dataclass
 class Lab:
     """合规实验室的内存仓储与全部业务操作（可整体序列化为 JSON 快照）。"""
@@ -117,7 +181,8 @@ class Lab:
     devices: dict = field(default_factory=dict)
     builds: dict = field(default_factory=dict)
     tasks: dict = field(default_factory=dict)
-    events: dict = field(default_factory=dict)            # event_id -> event（全局幂等）
+    events: dict = field(default_factory=dict)            # (task_id, event_id) -> event（内容指纹幂等）
+    conflicts: dict = field(default_factory=dict)         # (task_id, event_id) -> 冲突记录（两份摘要并存）
     findings: dict = field(default_factory=dict)
     cases: dict = field(default_factory=dict)             # case 键为责任主体
     notices: dict = field(default_factory=dict)
@@ -253,43 +318,144 @@ class Lab:
         return task
 
     def ingest_events(self, task_id, events):
-        """幂等接收一批事件。
+        """幂等接收一批事件，按单条结果分类。
 
-        同一 (task_id, event_id) 重传直接判重，不产生重复证据；
-        任务完成后到达的迟到事件照常追加，并触发追加判定。
+        判定以「编号 + 规范化内容指纹」为准：
+
+        * 编号未见：作为新事件接受（任务完成后到达则标记 late 并触发追加判定）；
+        * 编号相同且规范化内容完全一致：判为 duplicate（重传/重放），不重复落证据；
+        * 编号相同但规范化内容不同：判为 conflict，保存首次与本次两份摘要，
+          不覆盖首次证据、不进入任务事件索引、不触发重新判定，也不得伪装成迟到证据。
+
+        整批先校验后落地：任一条缺字段或事件类型非法则整批拒绝，
+        接收仓储与任务事件索引要么一致更新、要么都不动。
         """
         task = self._get_task(task_id)
-        accepted, duplicates = [], []
-        late = False
+
+        # ---- 第一趟：校验全部输入并逐条定类（不写任何仓储） ----
+        plan = []
+        pending = {}  # 本批次首次出现的 event_id -> (canonical, digest)
         for raw in events:
             event_id = _require(raw, "event_id", "事件")
-            dedup_key = (task_id, event_id)
-            if dedup_key in self.events:
-                duplicates.append(event_id)
-                continue
             event_type = _require(raw, "type", "事件")
             if event_type not in EVENT_TYPES:
                 raise DomainError(f"未知事件类型：{event_type}")
+            for required in ("seq", "occurred_at"):
+                _require(raw, required, "事件")
+            canonical = _canonical_event(raw)
+            digest = _canonical_digest(canonical)
+            key = (task_id, event_id)
+
+            if key in self.events:
+                base = self.events[key]
+                if digest == base["fingerprint"]:
+                    plan.append((RESULT_DUPLICATE, event_id, raw, None))
+                else:
+                    plan.append((RESULT_CONFLICT, event_id, raw, _canonical_event(base)))
+            elif event_id in pending:
+                base_canonical, base_digest = pending[event_id]
+                if digest == base_digest:
+                    plan.append((RESULT_DUPLICATE, event_id, raw, None))
+                else:
+                    plan.append((RESULT_CONFLICT, event_id, raw, base_canonical))
+            else:
+                pending[event_id] = (canonical, digest)
+                plan.append((RESULT_ACCEPTED, event_id, raw, canonical))
+
+        # ---- 第二趟：全部合法后统一落地（接收仓储与任务索引原子一致） ----
+        accepted, duplicates = [], []
+        conflict_records = {}
+        now = self.clock()
+        is_late_batch = task["status"] == "completed"
+        for status, event_id, raw, base_canonical in plan:
+            if status == RESULT_DUPLICATE:
+                duplicates.append(event_id)
+                continue
+            if status == RESULT_CONFLICT:
+                conflict_records[(task_id, event_id)] = self._record_conflict(
+                    task, event_id, raw, base_canonical, now, is_late_batch)
+                continue
+
+            canonical = base_canonical
             event = {
                 "event_id": event_id,
                 "task_id": task_id,
-                "seq": _require(raw, "seq", "事件"),
-                "type": event_type,
-                "occurred_at": _require(raw, "occurred_at", "事件"),
-                "received_at": self.clock(),
-                "late": task["status"] == "completed",
-                "payload": raw.get("payload", {}),
+                "seq": canonical["seq"],
+                "type": canonical["type"],
+                "occurred_at": canonical["occurred_at"],
+                "received_at": now,
+                "late": is_late_batch,
+                "payload": canonical["payload"],
+                "fingerprint": _canonical_digest(canonical),
             }
-            self.events[dedup_key] = event
+            self.events[(task_id, event_id)] = event
             task["event_ids"].append(event_id)
             accepted.append(event_id)
-            if event["late"]:
-                late = True
-        result = {"accepted": accepted, "duplicates": duplicates}
-        if accepted and task["status"] == "completed":
+
+        result = {
+            "accepted": accepted,
+            "duplicates": duplicates,
+            "conflicts": [self._conflict_view(c) for c in conflict_records.values()],
+            "results": [],
+        }
+        for status, event_id, _raw, _base in plan:
+            row = {"event_id": event_id, "status": status}
+            if status == RESULT_CONFLICT:
+                row["differing_fields"] = self.conflicts[(task_id, event_id)]["differing_fields"]
+            result["results"].append(row)
+        # 仅当真正追加了新证据（而非仅冲突）才追加判定；冲突永不触发重新判定。
+        if accepted and is_late_batch:
             result["assessment"] = self._evaluate(task)
-            result["late_arrivals"] = late
+            result["late_arrivals"] = True
+        elif not is_late_batch:
+            result["late_arrivals"] = False
         return result
+
+    def _record_conflict(self, task, event_id, incoming_raw, base_canonical, at, late):
+        """登记一次同编号异内容冲突；首次证据原样保留，冲突双方摘要并存。"""
+        task_id = task["task_id"]
+        key = (task_id, event_id)
+        incoming = _event_summary(incoming_raw)
+        incoming_digest = _canonical_digest(_canonical_event(incoming_raw))
+        record = self.conflicts.get(key)
+        if record is None:
+            record = {
+                "task_id": task_id,
+                "event_id": event_id,
+                "first_received_at": at,
+                "first": _event_summary(base_canonical),
+                "first_fingerprint": _canonical_digest(base_canonical),
+                "alternatives": [],
+                "conflict_count": 0,
+            }
+            self.conflicts[key] = record
+        # 同一异内容指纹只留存一份变体，但计数累计，保证重复冲突提交可识别。
+        if not any(a["fingerprint"] == incoming_digest for a in record["alternatives"]):
+            record["alternatives"].append({
+                "received_at": at,
+                "late": late,
+                "fingerprint": incoming_digest,
+                "summary": incoming,
+            })
+        record["conflict_count"] += 1
+        record["latest_conflict_at"] = at
+        record["latest_fingerprint"] = incoming_digest
+        record["latest_summary"] = incoming
+        record["differing_fields"] = _diff_canonical(
+            _canonical_event(record["first"]), _canonical_event(incoming))
+        return record
+
+    @staticmethod
+    def _conflict_view(record):
+        return {
+            "event_id": record["event_id"],
+            "differing_fields": record["differing_fields"],
+            "first_received_at": record["first_received_at"],
+            "first": record["first"],
+            "conflicting": record["latest_summary"],
+            "conflict_count": record["conflict_count"],
+            "latest_conflict_at": record["latest_conflict_at"],
+        }
 
     def complete_task(self, task_id):
         task = self._get_task(task_id)
@@ -672,6 +838,12 @@ class Lab:
         build = self.builds[task["build_id"]]
         device = self.devices[task["device_id"]]
         findings = [f for f in self.findings.values() if f["task_id"] == task_id]
+        conflicts = [
+            self._conflict_view(record)
+            for (_tid, _eid), record in sorted(
+                self.conflicts.items(), key=lambda kv: kv[0][1])
+            if _tid == task_id
+        ]
         return {
             "task": {
                 "task_id": task_id,
@@ -688,6 +860,8 @@ class Lab:
             "device": device,
             "event_count": len(task["event_ids"]),
             "findings": [self._finding_snapshot(f) for f in findings],
+            # 同编号异内容冲突：可定位冲突编号与差异字段，首次证据与冲突摘要并存
+            "conflicts": conflicts,
         }
 
     def build_report(self, build_id):
@@ -786,7 +960,7 @@ class Lab:
     # 持久化快照：键含元组的仓储与自增序列
     # ------------------------------------------------------------------ #
 
-    _TUPLE_DICTS = ("scripts", "events", "cases")
+    _TUPLE_DICTS = ("scripts", "events", "conflicts", "cases")
 
     def to_snapshot(self):
         data = {"next_seq": next(self._seq)}
@@ -806,5 +980,9 @@ class Lab:
             setattr(lab, name, data.get(name, {} if name != "regulation_order" else []))
         for name in cls._TUPLE_DICTS:
             setattr(lab, name, {tuple(item["key"]): item["value"] for item in data.get(name, [])})
+        # 兼容旧快照：为缺少指纹的既有事件补算首次指纹，恢复后继续沿用首次指纹判冲突。
+        for event in lab.events.values():
+            if "fingerprint" not in event:
+                event["fingerprint"] = _canonical_digest(_canonical_event(event))
         lab._seq = count(data.get("next_seq", 1))
         return lab
